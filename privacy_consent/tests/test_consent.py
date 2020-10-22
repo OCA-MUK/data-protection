@@ -1,8 +1,10 @@
 # Copyright 2018 Tecnativa - Jairo Llopis
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
 
+from contextlib import contextmanager
+
 from odoo.exceptions import ValidationError
-from odoo.tests.common import HttpCase
+from odoo.tests.common import HttpCase, Form
 
 
 class ActivityCase(HttpCase):
@@ -36,6 +38,11 @@ class ActivityCase(HttpCase):
         self.partners += self.partners.create({
             "name": "consent-partner-3",
         })
+        # Partner with wrong email, on purpose
+        self.partners += self.partners.create({
+            "name": "consent-partner-4",
+            "email": "wrong-mail",
+        })
         # Blacklist some partners
         self.blacklists = self.env["mail.blacklist"]
         self.blacklists += self.blacklists._add("partner1@example.com")
@@ -65,6 +72,37 @@ class ActivityCase(HttpCase):
             "server_action_id": self.sync_blacklist.id,
         })
 
+    @contextmanager
+    def _patch_build(self):
+        self._built_messages = []
+        IMS = self.env['ir.mail_server']
+
+        def _build_email(
+            _self,
+            email_from,
+            email_to,
+            subject,
+            body,
+            *args,
+            **kwargs
+        ):
+            self._built_messages.append(body)
+            return _build_email.origin(
+                _self,
+                email_from,
+                email_to,
+                subject,
+                body,
+                *args,
+                **kwargs,
+            )
+
+        try:
+            IMS._patch_method('build_email', _build_email)
+            yield
+        finally:
+            IMS._revert_method('build_email')
+
     def check_activity_auto_properly_sent(self):
         """Check emails sent by ``self.activity_auto``."""
         consents = self.env["privacy.consent"].search([
@@ -76,30 +114,53 @@ class ActivityCase(HttpCase):
             messages = consent.message_ids
             self.assertEqual(len(messages), 2)
         # Check sent mails
-        self.cron_mail_queue.method_direct_trigger()
-        for consent in consents:
-            self.assertEqual(consent.state, "sent")
+        with self._patch_build():
+            self.cron_mail_queue.method_direct_trigger()
+        for index, consent in enumerate(consents):
+            good_email = "@" in (consent.partner_id.email or "")
+            expected_messages = 3 if good_email else 2
+            self.assertEqual(
+                consent.state,
+                "sent" if good_email else "draft",
+            )
             messages = consent.message_ids
-            self.assertEqual(len(messages), 3)
+            self.assertEqual(len(messages), expected_messages)
             # 2nd message notifies creation
             self.assertEqual(
-                messages[2].subtype_id,
+                messages[expected_messages - 1].subtype_id,
                 self.mt_consent_consent_new,
             )
             # 3rd message notifies subject
             # Placeholder links should be logged
-            self.assertTrue("/privacy/consent/accept/" in messages[1].body)
-            self.assertTrue("/privacy/consent/reject/" in messages[1].body)
+            self.assertIn(
+                "/privacy/consent/accept/",
+                messages[expected_messages - 2].body)
+            self.assertIn(
+                "/privacy/consent/reject/",
+                messages[expected_messages - 2].body)
             # Tokenized links shouldn't be logged
-            self.assertFalse(consent._url(True) in messages[1].body)
-            self.assertFalse(consent._url(False) in messages[1].body)
+            self.assertNotIn(
+                consent._url(True),
+                messages[expected_messages - 2].body)
+            self.assertNotIn(
+                consent._url(False),
+                messages[expected_messages - 2].body)
             # 4th message contains the state change
-            self.assertEqual(
-                messages[0].subtype_id,
-                self.mt_consent_state_changed,
-            )
+            if good_email:
+                self.assertEqual(
+                    messages[0].subtype_id,
+                    self.mt_consent_state_changed,
+                )
             # Partner's is_blacklisted should be synced with default consent
             self.assertFalse(consent.partner_id.is_blacklisted)
+            # Check the sent message was built properly tokenized
+            accept_url, reject_url = map(consent._url, (True, False))
+            for body in self._built_messages:
+                if accept_url in body and reject_url in body:
+                    self._built_messages.remove(body)
+                    break
+            else:
+                raise AssertionError("Some message body should have these urls")
 
     def test_default_template(self):
         """We have a good mail template by default."""
@@ -141,21 +202,21 @@ class ActivityCase(HttpCase):
     def test_generate_manually(self):
         """Manually-generated consents work as expected."""
         for partner in self.partners:
-            if partner.email:
+            if "@" in (partner.email or ""):
                 self.blacklists._remove(partner.email)
         result = self.activity_manual.action_new_consents()
         self.assertEqual(result["res_model"], "privacy.consent")
         consents = self.env[result["res_model"]].search(result["domain"])
-        self.assertEqual(consents.mapped("state"), ["draft"] * 2)
+        self.assertEqual(consents.mapped("state"), ["draft"] * 3)
         self.assertEqual(
             consents.mapped("partner_id.is_blacklisted"),
-            [False] * 2,
+            [False] * 3,
         )
-        self.assertEqual(consents.mapped("accepted"), [False] * 2)
-        self.assertEqual(consents.mapped("last_metadata"), [False] * 2)
+        self.assertEqual(consents.mapped("accepted"), [False] * 3)
+        self.assertEqual(consents.mapped("last_metadata"), [False] * 3)
         # Check sent mails
         messages = consents.mapped("message_ids")
-        self.assertEqual(len(messages), 2)
+        self.assertEqual(len(messages), 3)
         subtypes = messages.mapped("subtype_id")
         self.assertTrue(subtypes & self.mt_consent_consent_new)
         self.assertFalse(subtypes & self.mt_consent_acceptance_changed)
@@ -163,19 +224,27 @@ class ActivityCase(HttpCase):
         # Send one manual request
         action = consents[0].action_manual_ask()
         self.assertEqual(action["res_model"], "mail.compose.message")
-        composer = self.env[action["res_model"]] \
-            .with_context(active_ids=consents[0].ids,
-                          active_model=consents._name,
-                          **action["context"]).create({})
-        composer.onchange_template_id_wrapper()
-        composer.send_mail()
+        Composer = self.env[action["res_model"]].with_context(
+            active_ids=consents[0].ids,
+            active_model=consents._name,
+            **action["context"],
+        )
+        composer_wizard = Form(Composer)
+        self.assertIn(consents[0].partner_id.name, composer_wizard.body)
+        composer_record = composer_wizard.save()
+        with self._patch_build():
+            composer_record.send_mail()
+        # Check the sent message was built properly tokenized
+        body = self._built_messages[0]
+        self.assertIn(consents[0]._url(True), body)
+        self.assertIn(consents[0]._url(False), body)
         messages = consents.mapped("message_ids") - messages
         self.assertEqual(len(messages), 2)
         self.assertEqual(messages[0].subtype_id, self.mt_consent_state_changed)
-        self.assertEqual(consents.mapped("state"), ["sent", "draft"])
+        self.assertEqual(consents.mapped("state"), ["sent", "draft", "draft"])
         self.assertEqual(
             consents.mapped("partner_id.is_blacklisted"),
-            [False, False],
+            [True, False, False],
         )
         # Placeholder links should be logged
         self.assertTrue("/privacy/consent/accept/" in messages[1].body)
@@ -192,10 +261,11 @@ class ActivityCase(HttpCase):
         self.assertIn(self.activity_manual.name, result)
         self.assertIn(self.activity_manual.description, result)
         consents.invalidate_cache()
-        self.assertEqual(consents.mapped("accepted"), [True, False])
+        self.assertEqual(consents.mapped("accepted"), [True, False, False])
         self.assertTrue(consents[0].last_metadata)
         self.assertFalse(consents[0].partner_id.is_blacklisted)
-        self.assertEqual(consents.mapped("state"), ["answered", "draft"])
+        self.assertEqual(
+            consents.mapped("state"), ["answered", "draft", "draft"])
         self.assertEqual(
             consents[0].message_ids[0].subtype_id,
             self.mt_consent_acceptance_changed,
@@ -207,10 +277,11 @@ class ActivityCase(HttpCase):
         self.assertIn(self.activity_manual.name, result)
         self.assertIn(self.activity_manual.description, result)
         consents.invalidate_cache()
-        self.assertEqual(consents.mapped("accepted"), [False, False])
+        self.assertEqual(consents.mapped("accepted"), [False, False, False])
         self.assertTrue(consents[0].last_metadata)
         self.assertTrue(consents[0].partner_id.is_blacklisted)
-        self.assertEqual(consents.mapped("state"), ["answered", "draft"])
+        self.assertEqual(
+            consents.mapped("state"), ["answered", "draft", "draft"])
         self.assertEqual(
             consents[0].message_ids[0].subtype_id,
             self.mt_consent_acceptance_changed,
